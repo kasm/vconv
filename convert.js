@@ -6,127 +6,242 @@ const path = require('path');
 const inputDir = path.join(__dirname, 'input');
 const outputDir = path.join(__dirname, 'output');
 
-// --- 2. Определите ваши пресеты ---
-// Мы используем массив 'cli' для опций, так как это безопаснее
-// для обработки путей и аргументов, чем одна строка.
+// --- 2. Настройка логгера ---
+const now = new Date();
+const dateStr = now.toISOString().split('T')[0].replace(/-/g, '_'); // YYYY_MM_DD
+const logFileName = path.join(__dirname, `process_${dateStr}.log`);
+
+/**
+ * Записывает сообщение в консоль и в файл лога.
+ * @param {string} message - Сообщение для логирования.
+ */
+async function logInfo(message) {
+  const logMessage = `${new Date().toISOString()}: ${message}\n`;
+  try {
+    // Выводим в консоль без временной метки для чистоты
+    console.log(message);
+    // Записываем в файл с временной меткой
+    await fs.appendFile(logFileName, logMessage);
+  } catch (err) {
+    console.error('CRITICAL: Failed to write to log file:', err);
+  }
+}
+
+// --- 3. Определите ваши пресеты ---
 const PRESETS = {
-  // Сжимает видео, уменьшая разрешение на 50%
   'conv0_5': {
     cli: [
-      '-vf', 'scale=iw*0.5:ih*0.5', // video filter: scale width and height by 0.5
-      '-c:v', 'libx264',           // video codec: h.264
-      '-crf', '28',                // quality (constant rate factor): 28 (higher is smaller/worse)
-      '-c:a', 'aac',               // audio codec: aac
-      '-b:a', '128k',              // audio bitrate: 128k
+      '-vf', 'scale=iw*0.5:ih*0.5',
+      '-c:v', 'libx264',
+      '-crf', '28',
+      '-c:a', 'aac',
+      '-b:a', '128k',
     ],
     outputExtension: '.mp4'
   },
-  
-  // Стандартный веб-пресет H.264 (хорошее качество)
   'web_h264': {
     cli: [
       '-c:v', 'libx264',
       '-crf', '23',
-      '-preset', 'medium', // 'slow' is better quality, 'fast' is faster
+      '-preset', 'medium',
       '-c:a', 'aac',
       '-b:a', '160k',
-      '-movflags', '+faststart' // Оптимизирует для веб-стриминга
+      '-movflags', '+faststart'
     ],
     outputExtension: '.mp4'
   },
-  
-  // Извлекает только аудио в MP3
   'extract_audio': {
     cli: [
-      '-vn',         // No video
+      '-vn',
       '-c:a', 'libmp3lame',
-      '-q:a', '2'    // MP3 quality (0-9, 0 is best)
+      '-q:a', '2'
     ],
     outputExtension: '.mp3'
   }
 };
 
-// Список расширений файлов, которые мы считаем видео
 const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv'];
 
-// --- 3. Главная функция конвертации ---
-async function convertVideos(presetName) {
-  console.log(`🚀 Начинаем конвертацию с пресетом: ${presetName}`);
+// --- 4. Вспомогательные функции ---
 
-  // 3.1. Проверяем, существует ли пресет
+/**
+ * Оборачивает ffprobe в Promise для получения метаданных файла.
+ * @param {string} filePath - Путь к файлу.
+ * @returns {Promise<object>} - Объект с метаданными.
+ */
+function getFileStats(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) {
+        return reject(new Error(`ffprobe error for ${filePath}: ${err.message}`));
+      }
+      
+      const format = metadata.format;
+      const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+      const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+      
+      resolve({
+        size: format.size,
+        duration: format.duration,
+        videoCodec: videoStream ? videoStream.codec_name : 'N/A',
+        videoBitrate: videoStream ? (videoStream.bit_rate || 'N/A') : 'N/A',
+        audioCodec: audioStream ? audioStream.codec_name : 'N/A',
+        audioBitrate: audioStream ? (audioStream.bit_rate || 'N/A') : 'N/A',
+      });
+    });
+  });
+}
+
+/** Форматирует байты в читаемый вид (KB, MB, GB). */
+function formatBytes(bytes) {
+  if (bytes === 0 || !bytes) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+/** Форматирует битрейт в читаемый вид (kb/s). */
+function formatBitrate(bitrate) {
+  if (!bitrate || bitrate === 'N/A' || isNaN(bitrate)) return 'N/A';
+  return (parseInt(bitrate) / 1000).toFixed(0) + ' kb/s';
+}
+
+// --- 5. Главная функция конвертации ---
+async function convertVideos(presetName) {
+  await logInfo(`🚀 Начинаем сессию конвертации с пресетом: ${presetName}`);
+
   const preset = PRESETS[presetName];
   if (!preset) {
-    console.error(`❌ Ошибка: Пресет "${presetName}" не найден.`);
-    console.log('Доступные пресеты:', Object.keys(PRESETS).join(', '));
+    await logInfo(`❌ Ошибка: Пресет "${presetName}" не найден.`);
+    await logInfo(`Доступные пресеты: ${Object.keys(PRESETS).join(', ')}`);
     return;
   }
 
+  let files;
   try {
-    // 3.2. Убедимся, что папки существуют
     await fs.mkdir(inputDir, { recursive: true });
     await fs.mkdir(outputDir, { recursive: true });
+    files = await fs.readdir(inputDir);
+  } catch (err) {
+    await logInfo(`❌ Критическая ошибка чтения/создания папок: ${err.message}`);
+    return;
+  }
 
-    // 3.3. Читаем все файлы из папки input
-    const files = await fs.readdir(inputDir);
+  const videoFiles = files.filter(file => 
+    VIDEO_EXTENSIONS.includes(path.extname(file).toLowerCase())
+  );
 
-    const videoFiles = files.filter(file => 
-      VIDEO_EXTENSIONS.includes(path.extname(file).toLowerCase())
-    );
+  if (videoFiles.length === 0) {
+    await logInfo('🟡 В папке /input не найдено видеофайлов.');
+    return;
+  }
 
-    if (videoFiles.length === 0) {
-      console.warn('🟡 В папке /input не найдено видеофайлов.');
-      return;
+  await logInfo(`Найдено ${videoFiles.length} видеофайлов. Начинаем поочередную обработку...`);
+
+  let successCount = 0;
+  let failedCount = 0;
+
+  // Используем for...of цикл для последовательной обработки
+  for (let i = 0; i < videoFiles.length; i++) {
+    const file = videoFiles[i];
+    const fileData = path.parse(file);
+    const inputPath = path.join(inputDir, file);
+    const outputName = `${fileData.name}${preset.outputExtension}`;
+    const outputPath = path.join(outputDir, outputName);
+
+    await logInfo(`\n--- [${i + 1}/${videoFiles.length}] Начинаем обработку: ${file} ---`);
+    
+    let sourceStats;
+    try {
+      // 1. Получаем статистику ИСХОДНОГО файла
+      sourceStats = await getFileStats(inputPath);
+      await logInfo(`  Source Stats:`);
+      await logInfo(`    File Size: ${formatBytes(sourceStats.size)}`);
+      await logInfo(`    Video: ${sourceStats.videoCodec} @ ${formatBitrate(sourceStats.videoBitrate)}`);
+      await logInfo(`    Audio: ${sourceStats.audioCodec} @ ${formatBitrate(sourceStats.audioBitrate)}`);
+    } catch (err) {
+      await logInfo(`❌ Ошибка получения статистики (ffprobe) для ${file}: ${err.message}`);
+      await logInfo(`--- Пропускаем файл: ${file} ---`);
+      failedCount++;
+      continue; // Переходим к следующему файлу
     }
 
-    console.log(`Найдено ${videoFiles.length} видеофайлов. Начинаем обработку...`);
+    const startTime = new Date();
+    await logInfo(`  Start Time: ${startTime.toISOString()}`);
 
-    // 3.4. Создаем массив промисов для каждой конвертации
-    const conversionPromises = videoFiles.map(file => {
-      const inputPath = path.join(inputDir, file);
-      
-      // Формируем имя выходного файла
-      const fileData = path.parse(file);
-      const outputName = `${fileData.name}${preset.outputExtension}`;
-      const outputPath = path.join(outputDir, outputName);
-
-      // Возвращаем промис, который управляет одним процессом ffmpeg
-      return new Promise((resolve, reject) => {
+    // 2. Запускаем конвертацию в Promise
+    let conversionError = null;
+    try {
+      await new Promise((resolve, reject) => {
         ffmpeg(inputPath)
-          .addOutputOptions(preset.cli) // Применяем наши CLI опции
+          .addOutputOptions(preset.cli)
           .output(outputPath)
-          .on('start', (command) => console.log(`[${file}]: Начата обработка...`))
+          .on('start', (command) => {
+            // Не логируем в файл, слишком много спама, но полезно для отладки
+            console.log(`[${file}] FFmpeg команда: ${command}`);
+          })
+          .on('progress', (progress) => {
+            // Показываем % в консоли на одной строке
+            if (progress.percent) {
+              process.stdout.write(`[${file}]: ⏳ Processing... ${progress.percent.toFixed(2)}% complete\r`);
+            }
+          })
           .on('end', () => {
-            console.log(`[${file}]: ✅ Конвертация успешно завершена -> ${outputName}`);
-            resolve({ file, status: 'success' });
+            process.stdout.write('\n'); // Очищаем строку прогресса
+            resolve();
           })
           .on('error', (err) => {
-            console.error(`[${file}]: ❌ Ошибка: ${err.message}`);
-            reject({ file, status: 'error', message: err.message });
+            process.stdout.write('\n'); // Очищаем строку прогресса
+            reject(err);
           })
           .run();
       });
-    });
+    } catch (err) {
+      conversionError = err;
+    }
 
-    // 3.5. Ждем завершения всех конвертаций
-    const results = await Promise.allSettled(conversionPromises);
+    const endTime = new Date();
+    const durationMs = endTime.getTime() - startTime.getTime();
+    await logInfo(`  End Time: ${endTime.toISOString()}`);
+    await logInfo(`  Duration: ${(durationMs / 1000).toFixed(2)} seconds`);
 
-    // 3.6. Выводим итог
-    const successCount = results.filter(r => r.status === 'fulfilled').length;
-    const failedCount = results.length - successCount;
+    // 3. Обрабатываем результат
+    if (conversionError) {
+      await logInfo(`  ❌ [${file}]: FAILED. Error: ${conversionError.message}`);
+      failedCount++;
+    } else {
+      // 4. Получаем статистику РЕЗУЛЬТИРУЮЩЕГО файла
+      try {
+        const targetStats = await getFileStats(outputPath);
+        await logInfo(`  Target Stats:`);
+        await logInfo(`    File Size: ${formatBytes(targetStats.size)}`);
+        await logInfo(`    Video: ${targetStats.videoCodec} @ ${formatBitrate(targetStats.videoBitrate)}`);
+        await logInfo(`    Audio: ${targetStats.audioCodec} @ ${formatBitrate(targetStats.audioBitrate)}`);
+        
+        // Сравнение размеров
+        const sizeChange = ((targetStats.size - sourceStats.size) / sourceStats.size) * 100;
+        await logInfo(`    Size Change: ${sizeChange.toFixed(2)}% (from ${formatBytes(sourceStats.size)} to ${formatBytes(targetStats.size)})`);
 
-    console.log('\n--- 🏁 Конвертация завершена ---');
-    console.log(`Успешно: ${successCount}`);
-    console.log(`С ошибками: ${failedCount}`);
-
-  } catch (err) {
-    console.error('❌ Произошла критическая ошибка:', err.message);
+        await logInfo(`  ✅ [${file}]: SUCCESS -> ${outputName}`);
+        successCount++;
+      } catch (err) {
+        await logInfo(`  ⚠️ [${file}]: SUCCESS, но не удалось получить статистику результата: ${err.message}`);
+        successCount++; // Считаем успешным, т.к. конвертация прошла
+      }
+    }
+    await logInfo(`--- Завершили: ${file} ---`);
   }
+
+  // 6. Выводим итог
+  await logInfo('\n--- 🏁 Сессия конвертации завершена ---');
+  await logInfo(`Успешно: ${successCount}`);
+  await logInfo(`С ошибками / Пропущено: ${failedCount}`);
+  await logInfo(`Все логи сохранены в: ${logFileName}`);
 }
 
-// --- 4. Запуск скрипта ---
+// --- 6. Запуск скрипта ---
 
-// Получаем имя пресета из аргументов командной строки
-// Пример: node convert.js web_h264
 const presetName = process.argv[2];
 
 if (!presetName) {
